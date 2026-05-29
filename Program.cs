@@ -1,6 +1,8 @@
+using System.Collections.Immutable;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using FluentValidation;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Identity;
@@ -9,6 +11,8 @@ using Microsoft.IdentityModel.Tokens;
 using TodoAPI.Data;
 using TodoAPI.DataTransfer;
 using TodoAPI.Entities;
+using TodoAPI.Enums;
+using TodoAPI.Validators;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -49,11 +53,71 @@ builder.Services.AddDbContext<TodoContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("TodoDb")));
 
 builder.Services.AddScoped<PasswordHasher<User>>();
+builder.Services.AddScoped<IValidator<CreateTodoRequest>, CreateTodoRequestValidator>();
 
 var app = builder.Build();
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.MapGet("/todos", async Task<Results<Ok<IReadOnlyList<GetTodoResponse>>, UnauthorizedHttpResult>> (
+    ClaimsPrincipal user,
+    TodoContext db
+) =>
+{
+    var userIdValue = user.FindFirstValue(ClaimTypes.NameIdentifier);
+
+    if (!int.TryParse(userIdValue, out var userId))
+    {
+        return TypedResults.Unauthorized();
+    }
+
+    IReadOnlyList<GetTodoResponse> userTodos = await db.Todos
+        .Where(todo => todo.UserId == userId)
+        .OrderBy(todo => todo.Id)
+        .Select(todo => new GetTodoResponse(todo.Id, todo.Details, todo.Status))
+        .ToListAsync();
+
+    return TypedResults.Ok(userTodos);
+}).RequireAuthorization();
+
+app.MapPost("/todos", async Task<Results<Created<CreatedTodoResponse>, ValidationProblem, UnauthorizedHttpResult>> (
+    CreateTodoRequest request,
+    ClaimsPrincipal user,
+    TodoContext db,
+    IValidator<CreateTodoRequest> validator
+) =>
+{
+    var validationResult = await validator.ValidateAsync(request);
+
+    if (!validationResult.IsValid)
+    {
+        return TypedResults.ValidationProblem(validationResult.ToDictionary());
+    }
+
+    var userIdValue = user.FindFirstValue(ClaimTypes.NameIdentifier);
+
+    if (!int.TryParse(userIdValue, out var userId))
+    {
+        return TypedResults.Unauthorized();
+    }
+
+    var todo = new Todo
+    {
+        Details = request.Details.Trim(),
+        Status = TodoStatus.NotStarted,
+        UserId = userId
+    };
+
+    db.Todos.Add(todo);
+    await db.SaveChangesAsync();
+
+    return TypedResults.Created(
+        $"/todos/{todo.Id}",
+        new CreatedTodoResponse(todo.Id, todo.Details, todo.Status)
+    );
+
+}).RequireAuthorization();
 
 app.MapPost("/login", async Task<Results<Ok<LoginUserResponse>, UnauthorizedHttpResult>> (
     LoginUserRequest request,
@@ -61,7 +125,6 @@ app.MapPost("/login", async Task<Results<Ok<LoginUserResponse>, UnauthorizedHttp
     PasswordHasher<User> passwordHasher,
     IConfiguration configuration) =>
 {
-    // Normalize email
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
 
     var user = await db.Users.FirstOrDefaultAsync(user => user.Email == normalizedEmail);
@@ -114,19 +177,15 @@ app.MapPost("/register", async Task<Results<Created<RegisterUserResponse>, Confl
     TodoContext db,
     PasswordHasher<User> passwordHasher) =>
 {
-    // Normalize email
     var normalizedEmail = request.Email.Trim().ToLowerInvariant();
 
-    // Check for existing user
     var emailExists = await db.Users.AnyAsync(user => user.Email == normalizedEmail);
 
-    // Return HTTP/1.1 409 Conflict if user exists
     if (emailExists)
     {
         return TypedResults.Conflict();
     }
 
-    // Create User entity with a temporary/placeholder PasswordHash
     var newUser = new User
     {
         Email = normalizedEmail,
